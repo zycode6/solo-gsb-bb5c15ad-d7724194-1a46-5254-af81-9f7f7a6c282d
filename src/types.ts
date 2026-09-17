@@ -103,3 +103,42 @@ export interface StreamAnalysis {
 
 /** 导出排序方式 */
 export type ExportOrder = 'stream' | 'sequence'
+
+/** 方案格式版本 */
+export const PLAN_FORMAT_VERSION = 1
+
+/** 方案中单个冲突序号的裁决记录 */
+export interface PlanResolution {
+  sequence: number
+  /** 所选候选的稳定标识（stableStringify 结果） */
+  candidateId: string
+}
+
+/** 方案中单条流的状态：起始序号与该流全部已裁决冲突 */
+export interface PlanStream {
+  stream: string
+  start: number
+  resolutions: PlanResolution[]
+}
+
+/**
+ * 可移植修复方案。
+ * fingerprint 为对“合法事件多重集”规范化后计算的 SHA-256：
+ * 输入行重排不改变指纹，但任一事件重复次数变化都会失配。
+ */
+export interface RepairPlan {
+  version: number
+  fingerprint: string
+  streams: PlanStream[]
+}
+
+/** 方案校验成功后得到的可一次性应用的状态 */
+export interface AppliedPlan {
+  starts: Record<string, number>
+  selections: Record<string, string>
+}
+
+/** 方案校验结果 */
+export type PlanValidation =
+  | { ok: true; plan: RepairPlan; applied: AppliedPlan }
+  | { ok: false; message: string }

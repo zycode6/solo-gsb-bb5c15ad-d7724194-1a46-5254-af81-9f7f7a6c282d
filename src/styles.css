@@ -551,6 +551,47 @@ code {
   margin: 4px 0;
 }
 
+/* ---------- Plan import / export ---------- */
+
+.plan-panel {
+  border-color: var(--border-strong);
+}
+
+.plan-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.plan-file-input {
+  display: none;
+}
+
+.plan-hint {
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+.plan-message {
+  margin: 12px 0 0;
+  padding: 9px 13px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.plan-ok {
+  color: #9be3b1;
+  background: rgba(70, 196, 110, 0.09);
+  border: 1px solid rgba(70, 196, 110, 0.4);
+}
+
+.plan-error {
+  color: #ffb3ba;
+  background: rgba(240, 97, 109, 0.08);
+  border: 1px solid rgba(240, 97, 109, 0.35);
+}
+
 /* ---------- Export ---------- */
 
 .export-controls {

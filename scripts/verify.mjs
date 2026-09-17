@@ -1,8 +1,17 @@
 // 核心逻辑端到端校验（非单测框架，node 直接运行）
+import nodeCrypto from 'node:crypto'
 import { parseNdjson } from '../src/lib/ndjson.ts'
 import { groupEvents, analyzeStream, analyzeAll, resolutionKey } from '../src/lib/model.ts'
 import { buildExport } from '../src/lib/export.ts'
 import { deepEqual, stableStringify } from '../src/lib/compare.ts'
+import {
+  buildPlan,
+  canonicalizeEvents,
+  fingerprintEvents,
+  sha256Hex,
+  validatePlanText,
+} from '../src/lib/plan.ts'
+import { PLAN_FORMAT_VERSION } from '../src/types.ts'
 
 let failures = 0
 function check(name, cond, extra = '') {
@@ -125,6 +134,121 @@ check('无确认事件时导出为空串', buildExport([], 'stream') === '')
 // 14. 无效裁决 id（候选已不存在）视为未裁决
 a1 = analyzeStream(s1, 1, { [resolutionKey('s1', 1)]: '{"v":999}' })
 check('失效裁决视为未裁决', a1.blockedByConflict && a1.prefix.length === 0)
+
+// 15. 修复方案：规范化与指纹
+{
+  // SHA-256 已知答案（空串 / abc），同时校验与 Web Crypto 结果一致
+  const enc = (s) => new TextEncoder().encode(s)
+  check(
+    '纯 JS SHA-256 空串向量',
+    sha256Hex(enc('')) === 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+  )
+  check(
+    '纯 JS SHA-256 abc 向量',
+    sha256Hex(enc('abc')) === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+  )
+  check(
+    '纯 JS SHA-256 长输入（跨块填充）与 node crypto 一致',
+    sha256Hex(enc('a'.repeat(1000))) ===
+      nodeCrypto.createHash('sha256').update('a'.repeat(1000)).digest('hex'),
+  )
+  check(
+    '纯 JS SHA-256 超长输入（>2^32 位，标准向量）',
+    sha256Hex(enc('a'.repeat(1_000_000))) ===
+      'cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0',
+  )
+
+  const base = [
+    '{"stream":"b","sequence":2,"payload":{"y":2,"x":1}}',
+    '{"stream":"a","sequence":1,"payload":[1,2]}',
+  ].join('\n')
+  const reordered = [
+    '{"stream":"a","sequence":1,"payload":[1, 2]}',
+    '{"stream":"b","sequence":2,"payload":{"x":1,"y":2}}',
+  ].join('\n')
+  const { events: evA } = parseNdjson(base)
+  const { events: evB } = parseNdjson(reordered)
+  check('规范化与行顺序/键顺序/空白无关', canonicalizeEvents(evA) === canonicalizeEvents(evB))
+
+  const dup = parseNdjson(base + '\n' + '{"stream":"a","sequence":1,"payload":[1,2]}')
+  check('重复次数改变 -> 规范化不同', canonicalizeEvents(dup.events) !== canonicalizeEvents(evA))
+  check('重复次数改变 -> 指纹不同', await fingerprintEvents(dup.events) !== await fingerprintEvents(evA))
+  check('重排指纹一致', await fingerprintEvents(evA) === await fingerprintEvents(evB))
+  check('指纹为 64 位小写十六进制', /^[0-9a-f]{64}$/.test(await fingerprintEvents(evA)))
+
+  // 16. 构建方案并成功导入：起点与裁决一次性应用
+  const starts = { s1: 1, s2: 10 }
+  const planObj = await buildPlan(events, starts, selA)
+  check('方案版本号', planObj.version === PLAN_FORMAT_VERSION)
+  check('方案含每流一条记录', planObj.streams.length === 2)
+  const ps1 = planObj.streams.find((s) => s.stream === 's1')
+  check(
+    '方案记录起点与裁决',
+    ps1.start === 1 && ps1.resolutions.length === 1 &&
+      ps1.resolutions[0].sequence === 1 &&
+      ps1.resolutions[0].candidateId === v2.id,
+  )
+  const planText = JSON.stringify(planObj)
+  const ok = await validatePlanText(planText, events)
+  check('合法方案校验通过', ok.ok === true)
+  if (ok.ok) {
+    check('应用起点', ok.applied.starts.s1 === 1 && ok.applied.starts.s2 === 10)
+    check(
+      '应用裁决映射',
+      ok.applied.selections[resolutionKey('s1', 1)] === v2.id &&
+        ok.applied.selections[resolutionKey('s2', 10)] === s2g.candidates[0].id,
+    )
+    // 应用后立即重算前缀：s1 到 #2，s2 到 #10
+    const reapplied = analyzeAll(builds, ok.applied.starts, ok.applied.selections)
+    check(
+      '应用后连续前缀立即重算',
+      reapplied.find((x) => x.name === 's1').prefix.map((e) => e.sequence).join() === '1,2' &&
+        reapplied.find((x) => x.name === 's2').prefix.length === 1,
+    )
+  }
+
+  // 17. 行重排后指纹仍匹配（可移植）
+  const shuffledText = input.split('\n').filter(Boolean).reverse().join('\n')
+  const { events: shuffled } = parseNdjson(shuffledText)
+  check('行重排后方案仍可导入', (await validatePlanText(planText, shuffled)).ok === true)
+
+  // 18. 各类无效方案整体拒绝
+  const reject = async (label, mutate, mutateEvents = events) => {
+    const p = structuredClone(planObj)
+    mutate(p)
+    const r = await validatePlanText(JSON.stringify(p), mutateEvents)
+    check(label, r.ok === false, r.ok ? '' : r.message)
+  }
+  check('非 JSON 被拒', (await validatePlanText('{bad json', events)).ok === false)
+  await reject('版本不被支持被拒', (p) => { p.version = 999 })
+  await reject('指纹格式非法被拒', (p) => { p.fingerprint = 'abc' })
+  await reject('指纹不匹配被拒', (p) => {
+    p.fingerprint = '0'.repeat(64)
+  })
+  await reject('数据重复次数变化 -> 指纹失配被拒', (p) => {}, dup.events)
+  await reject('未知流被拒', (p) => { p.streams[0].stream = 'nope' })
+  await reject('缺少流被拒', (p) => { p.streams.length = 1 })
+  await reject('起点非整数被拒', (p) => { p.streams[0].start = 1.5 })
+  await reject('裁决指向不存在序号被拒', (p) => {
+    p.streams.find((s) => s.stream === 's1').resolutions[0].sequence = 99
+  })
+  await reject('裁决候选不存在被拒', (p) => {
+    p.streams.find((s) => s.stream === 's1').resolutions[0].candidateId = '{"v":123}'
+  })
+  await reject('非冲突序号裁决被拒', (p) => {
+    const s2Plan = p.streams.find((s) => s.stream === 's2')
+    s2Plan.resolutions = [{ sequence: 10, candidateId: s2g.candidates[0].id }]
+    // s1 序号 2 非冲突
+    const s1Plan = p.streams.find((s) => s.stream === 's1')
+    s1Plan.resolutions.push({ sequence: 2, candidateId: stableStringify('ok') })
+  })
+
+  // 19. 拒绝不改变调用方状态（applied 不存在，starts/selections 保持原样）
+  const before = JSON.stringify(starts)
+  const bad = await validatePlanText('{bad', events)
+  check('拒绝时不产出可应用状态', bad.ok === false && bad.applied === undefined)
+  check('拒绝时调用方状态未动', JSON.stringify(starts) === before)
+}
 
 console.log(failures === 0 ? '\n全部通过 ✔' : `\n${failures} 项失败`)
 process.exit(failures === 0 ? 0 : 1)
