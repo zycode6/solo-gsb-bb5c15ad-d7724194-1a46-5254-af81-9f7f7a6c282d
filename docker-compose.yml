@@ -1,0 +1,8 @@
+services:
+  repair-bench:
+    build: .
+    image: event-sequence-repair-bench:latest
+    container_name: event-sequence-repair-bench
+    ports:
+      - "8080:80"
+    restart: unless-stopped
