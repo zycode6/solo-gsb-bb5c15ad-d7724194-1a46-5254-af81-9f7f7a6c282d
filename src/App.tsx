@@ -1,10 +1,16 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import type { ExportOrder } from './types'
 import { parseNdjson } from './lib/ndjson'
 import { analyzeAll, groupEvents, resolutionKey } from './lib/model'
 import { buildExport } from './lib/export'
+import { buildRepairPlan, importRepairPlan, stringifyPlan } from './lib/plan'
 import { StreamCard } from './components/StreamCard'
 import { SAMPLE } from './sample'
+
+type PlanNotice =
+  | { kind: 'success'; text: string }
+  | { kind: 'error'; text: string }
+  | null
 
 export function App() {
   const [text, setText] = useState('')
@@ -15,6 +21,10 @@ export function App() {
   const [selections, setSelections] = useState<Record<string, string>>({})
   const [order, setOrder] = useState<ExportOrder>('stream')
   const [copied, setCopied] = useState(false)
+  // 修复方案导入/导出提示；数据重新解析或手动修改裁决后清除
+  const [planNotice, setPlanNotice] = useState<PlanNotice>(null)
+  const [planBusy, setPlanBusy] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const hasData = parsedEvents.length > 0
 
@@ -55,6 +65,7 @@ export function App() {
       return next
     })
     setCopied(false)
+    setPlanNotice(null)
   }
 
   const handleLoadSample = () => {
@@ -68,10 +79,12 @@ export function App() {
     setStarts({})
     setSelections({})
     setCopied(false)
+    setPlanNotice(null)
   }
 
   const handleStartChange = (stream: string, start: number) => {
     setStarts((prev) => ({ ...prev, [stream]: start }))
+    setPlanNotice(null)
   }
 
   const handleResolve = (
@@ -84,6 +97,7 @@ export function App() {
       [resolutionKey(stream, sequence)]: candidateId,
     }))
     setCopied(false)
+    setPlanNotice(null)
   }
 
   const handleUnresolve = (stream: string, sequence: number) => {
@@ -93,6 +107,7 @@ export function App() {
       return next
     })
     setCopied(false)
+    setPlanNotice(null)
   }
 
   const builds = useMemo(() => groupEvents(parsedEvents), [parsedEvents])
@@ -127,17 +142,21 @@ export function App() {
   )
   const exportRows = exportText ? exportText.trimEnd().split('\n').length : 0
 
-  const handleDownload = () => {
-    if (!exportText) return
-    const blob = new Blob([exportText], { type: 'application/x-ndjson' })
+  const triggerDownload = (content: string, filename: string, mime: string) => {
+    const blob = new Blob([content], { type: mime })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = 'confirmed-events.ndjson'
+    a.download = filename
     document.body.appendChild(a)
     a.click()
     a.remove()
     URL.revokeObjectURL(url)
+  }
+
+  const handleDownload = () => {
+    if (!exportText) return
+    triggerDownload(exportText, 'confirmed-events.ndjson', 'application/x-ndjson')
   }
 
   const handleCopy = async () => {
@@ -154,6 +173,65 @@ export function App() {
       document.execCommand('copy')
       ta.remove()
       setCopied(true)
+    }
+  }
+
+  const handleDownloadPlan = async () => {
+    if (!hasData || planBusy) return
+    setPlanBusy(true)
+    setPlanNotice(null)
+    try {
+      const plan = await buildRepairPlan(parsedEvents, builds, starts, selections)
+      triggerDownload(
+        stringifyPlan(plan) + '\n',
+        'repair-plan.json',
+        'application/json',
+      )
+      setPlanNotice({
+        kind: 'success',
+        text: `方案已下载：${plan.resolutions.length} 项裁决、${Object.keys(plan.starts).length} 个流的起始序号，指纹与当前合法事件多重集绑定。`,
+      })
+    } finally {
+      setPlanBusy(false)
+    }
+  }
+
+  const handleImportPlanClick = () => {
+    setPlanNotice(null)
+    fileInputRef.current?.click()
+  }
+
+  const handleImportPlanFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    // 允许重复选择同一文件
+    e.target.value = ''
+    if (!file) return
+
+    setPlanBusy(true)
+    setPlanNotice(null)
+    try {
+      const content = await file.text()
+      const result = await importRepairPlan(content, parsedEvents, builds)
+      if (!result.ok) {
+        setPlanNotice({ kind: 'error', text: result.error })
+        return
+      }
+      // 全部校验通过后一次性应用；analyses 由 useMemo 立即重算连续前缀
+      const { applied } = result
+      setStarts(applied.starts)
+      setSelections(applied.selections)
+      setCopied(false)
+      setPlanNotice({
+        kind: 'success',
+        text: `方案「${file.name}」已应用：${applied.streamCount} 个流的起始序号、${applied.resolutionCount} 项冲突裁决，连续前缀已立即重算。`,
+      })
+    } catch (err) {
+      setPlanNotice({
+        kind: 'error',
+        text: `读取方案文件失败：${err instanceof Error ? err.message : String(err)}`,
+      })
+    } finally {
+      setPlanBusy(false)
     }
   }
 
@@ -257,9 +335,53 @@ export function App() {
             </div>
           </section>
 
+          <section className="panel plan-panel">
+            <div className="panel-head">
+              <h2>3. 修复方案导入 / 导出</h2>
+              <p className="panel-hint">
+                方案 JSON 包含版本、数据指纹、各流起始序号与所选候选的稳定标识；
+                行序变化不影响导入，事件增删或重复次数变化会被指纹拒绝
+              </p>
+            </div>
+            <div className="plan-controls">
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleDownloadPlan}
+                disabled={planBusy}
+              >
+                下载修复方案（JSON）
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={handleImportPlanClick}
+                disabled={planBusy}
+              >
+                从文件导入方案
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/json,.json"
+                className="plan-file-input"
+                onChange={handleImportPlanFile}
+              />
+              <span className="plan-hint">
+                仅在本机校验后一次性应用；任一项校验失败都会整体拒绝，不改变当前状态
+              </span>
+            </div>
+            {planNotice && (
+              <p className={`plan-notice plan-notice-${planNotice.kind}`}>
+                {planNotice.kind === 'success' ? '✔ ' : '✖ '}
+                {planNotice.text}
+              </p>
+            )}
+          </section>
+
           <section className="panel export-panel">
             <div className="panel-head">
-              <h2>3. 导出已确认连续事件</h2>
+              <h2>4. 导出已确认连续事件</h2>
               <div className="export-controls">
                 <label className="order-control">
                   排序
